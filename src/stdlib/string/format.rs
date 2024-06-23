@@ -2,7 +2,6 @@ use std::{
     char,
     cmp::Ordering,
     io::{Cursor, Write},
-    num::ParseIntError,
 };
 
 use gc_arena::{Collect, Gc};
@@ -108,7 +107,7 @@ enum OptionalArg {
     Specified(u8),
 }
 #[derive(Default, Clone, Copy)]
-struct CommonFormatArgs {
+struct FormatArgs {
     width: usize,
     precision: Option<usize>,
     left_align: bool,
@@ -154,13 +153,13 @@ impl FormatSpecifier {
     fn common_args<'gc>(
         &self,
         values: &mut impl Iterator<Item = Value<'gc>>,
-    ) -> Result<CommonFormatArgs, FormatError> {
+    ) -> Result<FormatArgs, FormatError> {
         let (width, width_neg) = self.get_arg(self.width, values)?;
         let (precision, _) = self.get_arg(self.precision, values)?;
         let left_align = self.flags.has(Flags::LEFT_ALIGN) || width_neg;
         let zero_pad = self.flags.has(Flags::ZERO_PAD) && !left_align;
         let alternate = self.flags.has(Flags::ALTERNATE);
-        Ok(CommonFormatArgs {
+        Ok(FormatArgs {
             width: width.unwrap_or(0),
             precision,
             left_align,
@@ -201,16 +200,16 @@ impl FormatSpecifier {
     }
 }
 
-impl CommonFormatArgs {
-    fn sign_char(&self, is_negative: bool) -> Option<u8> {
+impl FormatArgs {
+    fn sign_char(&self, is_negative: bool) -> &'static [u8] {
         if is_negative {
-            Some(b'-')
+            b"-"
         } else if self.flags.has(Flags::SIGN_FORCE) {
-            Some(b'+')
+            b"+"
         } else if self.flags.has(Flags::SIGN_SPACE) {
-            Some(b' ')
+            b" "
         } else {
-            None
+            b""
         }
     }
     fn integer_zeroed_width(&self, prefix: &[u8]) -> usize {
@@ -261,104 +260,8 @@ impl PadScope {
     }
 }
 
-struct PeekableIter<'a> {
-    base: &'a [u8],
-    cur: &'a [u8],
-}
-impl<'a> PeekableIter<'a> {
-    fn new(s: &'a [u8]) -> Self {
-        Self { base: s, cur: s }
-    }
-    fn peek(&mut self) -> Option<u8> {
-        self.cur.get(0).copied()
-    }
-    fn next(&mut self) -> Option<u8> {
-        let v = self.cur.get(0).copied();
-        self.cur = &self.cur[1..];
-        v
-    }
-    fn cur_index(&self) -> usize {
-        self.cur.as_ptr() as usize - self.base.as_ptr() as usize
-    }
-}
-
-fn parse_specifier<'gc>(str: &[u8], next: usize) -> Result<(FormatSpecifier, usize), FormatError> {
-    let mut iter = PeekableIter::new(&str[next + 1..]);
-
-    let mut flags = Flags::NONE;
-    #[rustfmt::skip]
-    let _ = loop {
-        match iter.peek() {
-            Some(b'#') => { iter.next(); flags |= Flags::ALTERNATE; },
-            Some(b'-') => { iter.next(); flags |= Flags::LEFT_ALIGN; },
-            Some(b'+') => { iter.next(); flags |= Flags::SIGN_FORCE; },
-            Some(b' ') => { iter.next(); flags |= Flags::SIGN_SPACE; },
-            Some(b'0') => { iter.next(); flags |= Flags::ZERO_PAD; },
-            _ => break,
-        }
-    };
-
-    let width = try_parse_optional_arg(&mut iter).map_err(|_| FormatError::BadWidth)?;
-    if !matches!(width, OptionalArg::None) {
-        flags |= Flags::WIDTH;
-    }
-
-    let precision;
-    if let Some(b'.') = iter.peek() {
-        iter.next();
-        let arg = try_parse_optional_arg(&mut iter).map_err(|_| FormatError::BadPrecision)?;
-        // Weirdly, %.f is a fine format specifier, and is treated as %.0f
-        precision = match arg {
-            OptionalArg::None => OptionalArg::Specified(0),
-            arg => arg,
-        };
-        flags |= Flags::PRECISION;
-    } else {
-        precision = OptionalArg::None;
-    }
-
-    let spec = iter.next().ok_or_else(|| FormatError::BadSpec(FMT_SPEC))?;
-    let spec_end = next + 1 + iter.cur_index();
-
-    Ok((
-        FormatSpecifier {
-            spec,
-            flags,
-            width,
-            precision,
-        },
-        spec_end,
-    ))
-}
-
-fn try_parse_optional_arg(iter: &mut PeekableIter<'_>) -> Result<OptionalArg, ParseIntError> {
-    match iter.peek() {
-        Some(b'*') => {
-            iter.next();
-            Ok(OptionalArg::Arg)
-        }
-        Some(b'0'..=b'9') => {
-            let rest = &iter.cur[1..];
-            let len = 1 + rest
-                .iter()
-                .position(|c| !matches!(c, b'0'..=b'9'))
-                .unwrap_or(rest.len());
-
-            // Safety: We just verified that the string is only composed
-            // of ASCII characters between 0 and 9.
-            let slice = unsafe { std::str::from_utf8_unchecked(&iter.cur[..len]) };
-
-            let num = slice.parse::<u8>()?;
-
-            iter.cur = &iter.cur[len..];
-            Ok(OptionalArg::Specified(num))
-        }
-        _ => Ok(OptionalArg::None),
-    }
-}
-
 fn integer_length(i: u64) -> usize {
-    1 + i.checked_ilog(10).unwrap_or(0) as usize
+    1 + i.checked_ilog10().unwrap_or(0) as usize
 }
 fn integer_length_hex(i: u64) -> usize {
     1 + i.checked_ilog2().unwrap_or(0) as usize / 4
@@ -370,7 +273,6 @@ fn integer_length_binary(i: u64) -> usize {
     1 + i.checked_ilog2().unwrap_or(0) as usize
 }
 
-// Could replace this with the memchr crate, if needed
 fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
 }
@@ -428,8 +330,8 @@ enum FloatMode {
 fn write_nonfinite_float<W: Write>(
     w: &mut W,
     float: f64,
-    args: CommonFormatArgs,
-    sign: Option<u8>,
+    args: FormatArgs,
+    sign: &[u8],
 ) -> Result<(), std::io::Error> {
     let s = match (float.is_infinite(), args.upper) {
         (true, false) => "inf",
@@ -437,7 +339,7 @@ fn write_nonfinite_float<W: Write>(
         (false, false) => "nan",
         (false, true) => "NAN",
     };
-    let pad = args.pad_num_before(w, s.len(), 0, sign.as_slice())?;
+    let pad = args.pad_num_before(w, s.len(), 0, sign)?;
     write!(w, "{s}")?;
     pad.finish_pad(w)?;
     return Ok(());
@@ -447,7 +349,7 @@ fn write_float<'gc, W: Write>(
     w: &mut W,
     float: f64,
     mode: FloatMode,
-    args: CommonFormatArgs,
+    args: FormatArgs,
     float_buf: &mut [u8],
 ) -> Result<(), Error<'gc>> {
     let sign = args.sign_char(float.is_sign_negative());
@@ -501,7 +403,7 @@ fn write_float<'gc, W: Write>(
             let len = str.len();
             let zero_width = if args.zero_pad { width } else { 0 };
 
-            let pad = args.pad_num_before(w, len, zero_width, sign.as_slice())?;
+            let pad = args.pad_num_before(w, len, zero_width, sign)?;
             write!(w, "{}", str)?;
             pad.finish_pad(w)?;
         } else {
@@ -519,11 +421,11 @@ fn write_float<'gc, W: Write>(
             let fallback_dec = preserve_decimal && !str.contains('.');
 
             if !fallback_dec {
-                let pad = args.pad_num_before(w, len, zero_width, sign.as_slice())?;
+                let pad = args.pad_num_before(w, len, zero_width, sign)?;
                 write!(w, "{mantissa}{e}{exp:+03}")?;
                 pad.finish_pad(w)?;
             } else {
-                let pad = args.pad_num_before(w, len + 1, zero_width, sign.as_slice())?;
+                let pad = args.pad_num_before(w, len + 1, zero_width, sign)?;
                 write!(w, "{mantissa}.{e}{exp:+03}")?;
                 pad.finish_pad(w)?;
             }
@@ -536,15 +438,15 @@ fn write_float<'gc, W: Write>(
         // TODO: cannot support the '#' preserving decimal mode
         // string.format("'%#.0f'", 1) should result in "1."
         match (args.left_align, args.zero_pad, sign) {
-            (false, false, None | Some(b'-')) => write!(w, "{float:width$.precision$}")?,
-            (false, true, None | Some(b'-')) => write!(w, "{float:>0width$.precision$}")?,
-            (false, false, Some(b'+')) => write!(w, "{float:+width$.precision$}")?,
-            (false, true, Some(b'+')) => write!(w, "{float:>+0width$.precision$}")?,
-            (false, false, Some(b' ')) => write!(w, " {float:width$.precision$}")?,
-            (false, true, Some(b' ')) => write!(w, " {float:>0width$.precision$}")?,
-            (true, _, None | Some(b'-')) => write!(w, "{float:<width$.precision$}")?,
-            (true, _, Some(b'+')) => write!(w, "{float:<+width$.precision$}")?,
-            (true, _, Some(b' ')) => write!(w, " {float:<width$.precision$}")?,
+            (false, false, b"" | b"-") => write!(w, "{float:width$.precision$}")?,
+            (false, true, b"" | b"-") => write!(w, "{float:>0width$.precision$}")?,
+            (false, false, b"+") => write!(w, "{float:+width$.precision$}")?,
+            (false, true, b"+") => write!(w, "{float:>+0width$.precision$}")?,
+            (false, false, b" ") => write!(w, " {float:width$.precision$}")?,
+            (false, true, b" ") => write!(w, " {float:>0width$.precision$}")?,
+            (true, _, b"" | b"-") => write!(w, "{float:<width$.precision$}")?,
+            (true, _, b"+") => write!(w, "{float:<+width$.precision$}")?,
+            (true, _, b" ") => write!(w, " {float:<width$.precision$}")?,
             _ => unreachable!(),
         }
     }
@@ -554,7 +456,7 @@ fn write_float<'gc, W: Write>(
 fn write_hex_float<W: Write>(
     w: &mut W,
     float: f64,
-    args: CommonFormatArgs,
+    args: FormatArgs,
 ) -> Result<(), std::io::Error> {
     let sign = args.sign_char(float.is_sign_negative());
     let preserve_decimal = args.alternate;
@@ -608,14 +510,14 @@ fn write_hex_float<W: Write>(
     };
 
     let prefix: &[u8] = match (sign, args.upper) {
-        (None, false) => b"0x",
-        (Some(b'-'), false) => b"-0x",
-        (Some(b'+'), false) => b"+0x",
-        (Some(b' '), false) => b" 0x",
-        (None, true) => b"0X",
-        (Some(b'-'), true) => b"-0X",
-        (Some(b'+'), true) => b"+0X",
-        (Some(b' '), true) => b" 0X",
+        (b"", false) => b"0x",
+        (b"-", false) => b"-0x",
+        (b"+", false) => b"+0x",
+        (b" ", false) => b" 0x",
+        (b"", true) => b"0X",
+        (b"-", true) => b"-0X",
+        (b"+", true) => b"+0X",
+        (b" ", true) => b" 0X",
         _ => unreachable!(),
     };
     let zero_width = if args.zero_pad {
@@ -660,7 +562,7 @@ fn write_value<'gc, W: Write>(
         Value::Boolean(b) => write!(w, "{}", b)?,
         Value::Integer(i) => write!(w, "{}", i)?,
         Value::Number(n) => {
-            write_hex_float(w, n, CommonFormatArgs::default())?;
+            write_hex_float(w, n, FormatArgs::default())?;
         }
         Value::String(str) => {
             // TODO: check string escaping
@@ -690,12 +592,13 @@ pub fn string_format<'gc>(
     stack: crate::Stack<'gc, '_>,
 ) -> Result<impl Sequence<'gc>, Error<'gc>> {
     let str = crate::string::String::from_value(ctx, stack.get(0))?;
-    Ok(FormatState::Start {
+    Ok(FormatState {
         buf: Vec::new(),
         arg_count: stack.len(),
         str,
         index: 0,
         value_index: 1,
+        inner: FormatStateInner::Start,
     })
 }
 
@@ -711,35 +614,22 @@ impl<'gc> Sequence<'gc> for FormatState<'gc> {
 }
 #[derive(Collect)]
 #[collect(no_drop)]
-enum FormatState<'gc> {
-    Start {
-        buf: Vec<u8>,
-        arg_count: usize,
-        str: crate::string::String<'gc>,
-        index: usize,
-        value_index: usize,
-    },
-    EvaluateSpecifier {
-        buf: Vec<u8>,
-        arg_count: usize,
-        str: crate::string::String<'gc>,
-        index: usize,
-        value_index: usize,
-        #[collect(require_static)]
-        spec: FormatSpecifier,
-    },
+struct FormatState<'gc> {
+    buf: Vec<u8>,
+    arg_count: usize,
+    str: crate::string::String<'gc>,
+    index: usize,
+    value_index: usize,
+    #[collect(require_static)]
+    inner: FormatStateInner,
+}
+enum FormatStateInner {
+    Start,
     EvaluateCallback {
-        buf: Vec<u8>,
-        arg_count: usize,
-        str: crate::string::String<'gc>,
-        index: usize,
-        value_index: usize,
-        #[collect(require_static)]
         spec: FormatSpecifier,
-        #[collect(require_static)]
         dest: EvalContinuation,
     },
-    End(Vec<u8>),
+    End,
 }
 fn step<'gc>(
     ctx: Context<'gc>,
@@ -749,124 +639,52 @@ fn step<'gc>(
     let mut float_buf = [0u8; 300];
 
     loop {
-        match *state {
-            FormatState::Start {
-                ref mut buf,
-                arg_count,
-                str,
-                mut index,
-                value_index,
-            } => {
-                if let Some(next) = memchr(FMT_SPEC, &str[index..]).map(|n| n + index) {
-                    if next != index {
-                        buf.write_all(&str[index..next])?;
+        match state.inner {
+            FormatStateInner::Start => {
+                if let Some(next) =
+                    memchr(FMT_SPEC, &state.str[state.index..]).map(|n| n + state.index)
+                {
+                    if next != state.index {
+                        state.buf.write_all(&state.str[state.index..next])?;
                     }
 
-                    let (spec, spec_end) = parse_specifier(str.as_bytes(), next)?;
-                    index = spec_end;
-                    assert!(index > next);
+                    let (spec, spec_end) = parse::parse_specifier(state.str.as_bytes(), next)?;
+                    state.index = spec_end;
+                    assert!(state.index > next);
 
-                    *state = FormatState::EvaluateSpecifier {
-                        buf: std::mem::take(buf),
-                        arg_count,
-                        str,
-                        index,
-                        value_index,
+                    state.inner = FormatStateInner::EvaluateCallback {
                         spec,
+                        dest: EvalContinuation::Init,
                     };
                 } else {
-                    if index < str.as_bytes().len() {
-                        buf.write_all(&str[index..])?;
+                    if state.index < state.str.as_bytes().len() {
+                        state.buf.write_all(&state.str[state.index..])?;
                     }
-                    *state = FormatState::End(std::mem::take(buf));
+                    state.inner = FormatStateInner::End;
                 }
             }
-            FormatState::EvaluateSpecifier {
-                ref mut buf,
-                arg_count,
-                str,
-                index,
-                mut value_index,
-                spec,
-            } => {
-                let mut values_iter = stack[value_index..arg_count].iter();
-                let poll = evaluate_specifier(
-                    ctx,
-                    &mut *buf,
-                    spec,
-                    &mut (&mut values_iter).copied(),
-                    &mut float_buf,
-                )?;
-                value_index = (values_iter.as_slice().as_ptr() as usize
-                    - stack[value_index..arg_count].as_ptr() as usize)
-                    / std::mem::size_of::<Value>();
+            FormatStateInner::EvaluateCallback { spec, dest } => {
+                let result = stack.get(state.arg_count);
+                stack.resize(state.arg_count);
 
-                match poll {
-                    EvalPoll::Done => (),
-                    EvalPoll::Call { call, then } => {
-                        *state = FormatState::EvaluateCallback {
-                            buf: std::mem::take(buf),
-                            arg_count,
-                            str,
-                            index,
-                            value_index,
-                            spec,
-                            dest: then,
-                        };
-                        let bottom = stack.len();
-                        stack.extend(call.args);
-                        return Ok(SequencePoll::Call {
-                            function: call.function,
-                            bottom,
-                        });
-                    }
-                }
-
-                *state = FormatState::Start {
-                    buf: std::mem::take(buf),
-                    arg_count,
-                    str,
-                    index,
-                    value_index,
-                };
-            }
-            FormatState::EvaluateCallback {
-                ref mut buf,
-                arg_count,
-                str,
-                index,
-                mut value_index,
-                spec,
-                dest,
-            } => {
-                let result = stack.get(arg_count);
-                stack.resize(arg_count);
-
-                let mut values_iter = stack[value_index..arg_count].iter();
+                let mut values_iter = stack[state.value_index..state.arg_count].iter();
                 let poll = evaluate_continuation(
                     ctx,
-                    &mut *buf,
+                    &mut state.buf,
                     dest,
                     spec,
                     Some(result),
                     &mut (&mut values_iter).copied(),
                     &mut float_buf,
                 )?;
-                value_index = stack[value_index..arg_count].as_ptr() as usize
-                    - values_iter.as_slice().as_ptr() as usize;
+                state.value_index = (values_iter.as_slice().as_ptr() as usize
+                    - stack[state.value_index..state.arg_count].as_ptr() as usize)
+                    / std::mem::size_of::<Value>();
 
                 match poll {
                     EvalPoll::Done => (),
                     EvalPoll::Call { call, then } => {
-                        *state = FormatState::EvaluateCallback {
-                            buf: std::mem::take(buf),
-                            arg_count,
-                            str,
-                            index,
-                            value_index,
-                            spec,
-                            dest: then,
-                        };
+                        state.inner = FormatStateInner::EvaluateCallback { spec, dest: then };
                         let bottom = stack.len();
                         stack.extend(call.args);
                         return Ok(SequencePoll::Call {
@@ -875,16 +693,10 @@ fn step<'gc>(
                         });
                     }
                 }
-                *state = FormatState::Start {
-                    buf: std::mem::take(buf),
-                    arg_count,
-                    str,
-                    index,
-                    value_index,
-                };
+                state.inner = FormatStateInner::Start;
             }
-            FormatState::End(ref mut buf) => {
-                stack.replace(ctx, ctx.intern(&std::mem::take(buf)));
+            FormatStateInner::End => {
+                stack.replace(ctx, ctx.intern(&state.buf));
                 return Ok(SequencePoll::Return);
             }
         };
@@ -901,7 +713,8 @@ enum EvalPoll<'gc> {
 
 #[derive(Copy, Clone)]
 enum EvalContinuation {
-    ToStringResult(CommonFormatArgs),
+    Init,
+    ToStringResult(FormatArgs),
 }
 
 fn evaluate_continuation<'gc, W: Write>(
@@ -910,8 +723,8 @@ fn evaluate_continuation<'gc, W: Write>(
     cont: EvalContinuation,
     spec: FormatSpecifier,
     result: Option<Value<'gc>>,
-    _values: &mut impl Iterator<Item = Value<'gc>>,
-    _float_buf: &mut [u8; 300],
+    values: &mut impl Iterator<Item = Value<'gc>>,
+    float_buf: &mut [u8; 300],
 ) -> Result<EvalPoll<'gc>, Error<'gc>> {
     match cont {
         EvalContinuation::ToStringResult(args) => {
@@ -926,9 +739,10 @@ fn evaluate_continuation<'gc, W: Write>(
             let pad = args.pad_num_before(w, truncated_len, 0, b"")?;
             w.write_all(&string[..truncated_len])?;
             pad.finish_pad(w)?;
+            Ok(EvalPoll::Done)
         }
+        EvalContinuation::Init => evaluate_specifier(ctx, w, spec, values, float_buf),
     }
-    Ok(EvalPoll::Done)
 }
 
 fn evaluate_specifier<'gc, W: Write>(
@@ -990,8 +804,8 @@ fn evaluate_specifier<'gc, W: Write>(
             let len = integer_length(int.unsigned_abs());
             let sign = args.sign_char(int < 0);
 
-            let zeroed_width = args.integer_zeroed_width(sign.as_slice());
-            let pad = args.pad_num_before(w, len, zeroed_width, sign.as_slice())?;
+            let zeroed_width = args.integer_zeroed_width(sign);
+            let pad = args.pad_num_before(w, len, zeroed_width, sign)?;
             write!(w, "{}", int.unsigned_abs())?;
             pad.finish_pad(w)?;
         }
@@ -1116,4 +930,107 @@ fn evaluate_specifier<'gc, W: Write>(
         c => return Err(FormatError::BadSpec(c).into()),
     }
     Ok(EvalPoll::Done)
+}
+
+mod parse {
+    use std::num::ParseIntError;
+
+    use super::{Flags, FormatError, FormatSpecifier, OptionalArg, FMT_SPEC};
+
+    struct PeekableIter<'a> {
+        base: &'a [u8],
+        cur: &'a [u8],
+    }
+    impl<'a> PeekableIter<'a> {
+        fn new(s: &'a [u8]) -> Self {
+            Self { base: s, cur: s }
+        }
+        fn peek(&mut self) -> Option<u8> {
+            self.cur.get(0).copied()
+        }
+        fn next(&mut self) -> Option<u8> {
+            let v = self.cur.get(0).copied();
+            self.cur = &self.cur[1..];
+            v
+        }
+        fn cur_index(&self) -> usize {
+            self.cur.as_ptr() as usize - self.base.as_ptr() as usize
+        }
+    }
+
+    pub fn parse_specifier<'gc>(
+        str: &[u8],
+        next: usize,
+    ) -> Result<(FormatSpecifier, usize), FormatError> {
+        let mut iter = PeekableIter::new(&str[next + 1..]);
+
+        let mut flags = Flags::NONE;
+        #[rustfmt::skip]
+        let _ = loop {
+            match iter.peek() {
+                Some(b'#') => { iter.next(); flags |= Flags::ALTERNATE; },
+                Some(b'-') => { iter.next(); flags |= Flags::LEFT_ALIGN; },
+                Some(b'+') => { iter.next(); flags |= Flags::SIGN_FORCE; },
+                Some(b' ') => { iter.next(); flags |= Flags::SIGN_SPACE; },
+                Some(b'0') => { iter.next(); flags |= Flags::ZERO_PAD; },
+                _ => break,
+            }
+        };
+
+        let width = try_parse_optional_arg(&mut iter).map_err(|_| FormatError::BadWidth)?;
+        if !matches!(width, OptionalArg::None) {
+            flags |= Flags::WIDTH;
+        }
+
+        let precision = if let Some(b'.') = iter.peek() {
+            iter.next();
+            flags |= Flags::PRECISION;
+            let arg = try_parse_optional_arg(&mut iter).map_err(|_| FormatError::BadPrecision)?;
+            match arg {
+                OptionalArg::None => OptionalArg::Specified(0),
+                arg => arg,
+            }
+        } else {
+            OptionalArg::None
+        };
+
+        let spec = iter.next().ok_or_else(|| FormatError::BadSpec(FMT_SPEC))?;
+        let spec_end = next + 1 + iter.cur_index();
+
+        Ok((
+            FormatSpecifier {
+                spec,
+                flags,
+                width,
+                precision,
+            },
+            spec_end,
+        ))
+    }
+
+    fn try_parse_optional_arg(iter: &mut PeekableIter<'_>) -> Result<OptionalArg, ParseIntError> {
+        match iter.peek() {
+            Some(b'*') => {
+                iter.next();
+                Ok(OptionalArg::Arg)
+            }
+            Some(b'0'..=b'9') => {
+                let rest = &iter.cur[1..];
+                let len = 1 + rest
+                    .iter()
+                    .position(|c| !matches!(c, b'0'..=b'9'))
+                    .unwrap_or(rest.len());
+
+                // Safety: We just verified that the string is only composed
+                // of ASCII characters between 0 and 9.
+                let slice = unsafe { std::str::from_utf8_unchecked(&iter.cur[..len]) };
+
+                let num = slice.parse::<u8>()?;
+
+                iter.cur = &iter.cur[len..];
+                Ok(OptionalArg::Specified(num))
+            }
+            _ => Ok(OptionalArg::None),
+        }
+    }
 }

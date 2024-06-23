@@ -1,4 +1,6 @@
-use crate::{Callback, CallbackReturn, Context, FromValue, String, Table};
+use crate::{Callback, CallbackReturn, Context, String, Table};
+
+mod format;
 
 pub fn load_string<'gc>(ctx: Context<'gc>) {
     let string = Table::new(&ctx);
@@ -114,17 +116,8 @@ pub fn load_string<'gc>(ctx: Context<'gc>) {
         .set(
             ctx,
             "format",
-            Callback::from_fn(&ctx, |ctx, _, mut stack| {
-                // TODO: sequence-based impl
-                // let string = String::from_value(ctx, stack.get(0))?;
-
-                // let args = &stack[1..stack.len()];
-                // let mut buf = Vec::new();
-                // super::strlib::string_format(ctx, &mut buf, &string, args.iter().copied())?;
-                // stack.replace(ctx, ctx.intern(&buf));
-
-                let seq = super::strlib::string_format(ctx, stack)?;
-
+            Callback::from_fn(&ctx, |ctx, _, stack| {
+                let seq = format::string_format(ctx, stack)?;
                 Ok(CallbackReturn::Sequence(crate::BoxSequence::new(&ctx, seq)))
             }),
         )
