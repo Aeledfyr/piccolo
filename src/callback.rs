@@ -243,6 +243,10 @@ pub trait Sequence<'gc>: Collect {
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         Err(error)
     }
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 #[derive(Collect)]

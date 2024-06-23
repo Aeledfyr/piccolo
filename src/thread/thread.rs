@@ -159,10 +159,12 @@ impl<'gc> Thread<'gc> {
     pub fn resume_err(self, mc: &Mutation<'gc>, error: Error<'gc>) -> Result<(), BadThreadMode> {
         let mut state = self.check_mode(mc, ThreadMode::Suspended)?;
         assert!(matches!(
-            state.frames.pop(),
+            state.frames.last(),
             Some(Frame::Start(_) | Frame::Yielded)
         ));
-        state.frames.push(Frame::Error(error));
+        let callstack = state.backtrace(mc, None);
+        state.frames.pop();
+        state.frames.push(Frame::Error(error, callstack));
         Ok(())
     }
 
@@ -277,6 +279,89 @@ pub(super) enum LuaReturn {
 
 #[derive(Debug, Collect)]
 #[collect(no_drop)]
+pub(super) enum CallstackFrame<'gc> {
+    Lua { closure: Closure<'gc>, pc: usize },
+    Sequence(&'static str),
+    Callback(Callback<'gc>),
+    Start(Function<'gc>),
+    Yielded,
+    WaitThread,
+    Result,
+    Error,
+}
+
+#[derive(Debug, Collect)]
+#[collect(no_drop)]
+pub(super) struct ErrorBacktrace<'gc>(vec::Vec<CallstackFrame<'gc>, MetricsAlloc<'gc>>);
+
+impl std::fmt::Display for ErrorBacktrace<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let width = self.0.len().max(1).ilog10() as usize + 1;
+        let indent = width + 2;
+        let s = "";
+        for (i, frame) in self.0.iter().rev().enumerate() {
+            write!(f, "{:>width$}: ", i)?;
+            match frame {
+                CallstackFrame::Lua { closure, pc } => {
+                    let proto = closure.prototype();
+                    if let Some((_, line)) = proto.opcode_line_numbers.get(
+                        proto
+                            .opcode_line_numbers
+                            .partition_point(|(x, _)| *x <= *pc)
+                            .saturating_sub(1)
+                            .saturating_sub(if i == 0 { 0 } else { 1 }), // TODO: figure out actual pc offset from call
+                    ) {
+                        writeln!(f, "{}", proto.reference)?;
+                        write!(f, "{s:indent$}at {}:{}", proto.chunk_name, line)?;
+                    } else {
+                        writeln!(f, "{}", proto.reference)?;
+                        write!(f, "{s:indent$}at {}", proto.chunk_name)?;
+                    }
+                }
+                CallstackFrame::Sequence(seq) => {
+                    write!(f, "in sequence {}", seq)?;
+                }
+                CallstackFrame::Callback(callback) => {
+                    write!(f, "in callback {:?}", callback)?;
+                }
+                CallstackFrame::Start(func) => match func {
+                    Function::Closure(c) => {
+                        let proto = c.prototype();
+                        if let Some((_, line)) = proto.opcode_line_numbers.first() {
+                            writeln!(f, "start {}", proto.reference)?;
+                            write!(f, "{s:indent$}at {}:{}", proto.chunk_name, line)?;
+                        } else {
+                            writeln!(f, "start {}", proto.reference)?;
+                            write!(f, "{s:indent$}at {}", proto.chunk_name)?;
+                        }
+                    }
+                    Function::Callback(c) => {
+                        write!(f, "in start {:?}", c)?;
+                    }
+                },
+                CallstackFrame::Yielded => {
+                    write!(f, "in yielded")?;
+                }
+                CallstackFrame::WaitThread => {
+                    write!(f, "in waitthread")?;
+                }
+                CallstackFrame::Result => {
+                    write!(f, "in result")?;
+                }
+                CallstackFrame::Error => {
+                    write!(f, "in error")?;
+                }
+            }
+            if i != self.0.len() - 1 {
+                writeln!(f)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Collect)]
+#[collect(no_drop)]
 pub(super) enum Frame<'gc> {
     /// A running Lua frame.
     Lua {
@@ -313,7 +398,7 @@ pub(super) enum Frame<'gc> {
     /// Results are waiting to be taken. Must be the top frame of the stack.
     Result { bottom: usize },
     /// An error is currently unwinding. Must be the top frame of the stack.
-    Error(Error<'gc>),
+    Error(Error<'gc>, ErrorBacktrace<'gc>),
 }
 
 #[derive(Debug, Collect)]
@@ -338,7 +423,7 @@ impl<'gc> ThreadState<'gc> {
                 Frame::Start(_) | Frame::Yielded => ThreadMode::Suspended,
                 Frame::WaitThread => ThreadMode::Waiting,
                 Frame::Result { .. } => ThreadMode::Result,
-                Frame::Error(_) => {
+                Frame::Error(..) => {
                     if self.frames.len() == 1 {
                         ThreadMode::Result
                     } else {
@@ -452,11 +537,18 @@ impl<'gc> ThreadState<'gc> {
     ) -> Result<impl Iterator<Item = Value<'gc>> + '_, Error<'gc>> {
         match self.frames.pop() {
             Some(Frame::Result { bottom }) => Ok(self.stack.drain(bottom..)),
-            Some(Frame::Error(err)) => {
+            Some(Frame::Error(err, stack)) => {
                 assert!(self.stack.is_empty());
                 assert!(self.frames.is_empty());
                 assert!(self.open_upvalues.is_empty());
-                Err(err)
+                // TODO: don't discard typeinfo, add metadata to Error?
+                // TODO: this breaks compat with tests
+                if std::env::var("DEBUG").as_deref() == Ok("1") {
+                    let err = anyhow::anyhow!(stack.to_string()).context(err.into_static());
+                    Err(err.into())
+                } else {
+                    Err(err)
+                }
             }
             _ => panic!("no results available to take"),
         }
@@ -518,6 +610,28 @@ impl<'gc> ThreadState<'gc> {
         assert!(self.open_upvalues.is_empty());
         self.stack.clear();
         self.frames.clear();
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn backtrace(
+        &self,
+        mc: &Mutation<'gc>,
+        active: Option<&Frame<'gc>>,
+    ) -> ErrorBacktrace<'gc> {
+        let count = self.frames.len() + active.is_some() as usize;
+        let mut frames = vec::Vec::with_capacity_in(count, MetricsAlloc::new(mc));
+        frames.extend(self.frames.iter().chain(active).map(|f| match *f {
+            Frame::Lua { closure, pc, .. } => CallstackFrame::Lua { closure, pc },
+            Frame::Sequence { ref sequence, .. } => CallstackFrame::Sequence(sequence.name()),
+            Frame::Start(func) => CallstackFrame::Start(func),
+            Frame::Callback { callback, .. } => CallstackFrame::Callback(callback),
+            Frame::Yielded => CallstackFrame::Yielded,
+            Frame::WaitThread => CallstackFrame::WaitThread,
+            Frame::Result { .. } => CallstackFrame::Result,
+            Frame::Error(_, _) => CallstackFrame::Error,
+        }));
+        ErrorBacktrace(frames)
     }
 }
 
