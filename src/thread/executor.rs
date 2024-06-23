@@ -201,7 +201,10 @@ impl<'gc> Executor<'gc> {
                                     top_state.return_to(bottom);
                                 }
                                 Err(err) => {
-                                    top_state.frames.push(Frame::Error(err.into()));
+                                    top_state.frames.push(Frame::Error(
+                                        err.into(),
+                                        top_state.backtrace(&ctx, Some(&Frame::WaitThread)),
+                                    ));
                                 }
                             }
                             drop(res_state);
@@ -213,6 +216,7 @@ impl<'gc> Executor<'gc> {
                                 expected: None,
                             }
                             .into(),
+                            top_state.backtrace(&ctx, Some(&Frame::WaitThread)),
                         )),
                     }
                 } else {
@@ -224,6 +228,7 @@ impl<'gc> Executor<'gc> {
                             expected: None,
                         }
                         .into(),
+                        top_state.backtrace(&ctx, None),
                     ));
                 }
             }
@@ -240,7 +245,9 @@ impl<'gc> Executor<'gc> {
                         if let Err(err) =
                             to_thread.resume(ctx, Variadic(top_state.stack.drain(bottom..)))
                         {
-                            top_state.frames.push(Frame::Error(err.into()));
+                            top_state
+                                .frames
+                                .push(Frame::Error(err.into(), top_state.backtrace(&ctx, None)));
                         } else {
                             top_state.frames.push(Frame::Yielded);
                             thread_stack.pop();
@@ -261,7 +268,9 @@ impl<'gc> Executor<'gc> {
                 ) {
                     if let Err(err) = thread.resume(ctx, Variadic(top_state.stack.drain(bottom..)))
                     {
-                        top_state.frames.push(Frame::Error(err.into()));
+                        top_state
+                            .frames
+                            .push(Frame::Error(err.into(), top_state.backtrace(&ctx, None)));
                     } else {
                         // Tail call the thread resume if we can.
                         if top_state.frames.is_empty() {
@@ -274,7 +283,7 @@ impl<'gc> Executor<'gc> {
                 }
 
                 match top_state.frames.pop() {
-                    Some(Frame::Callback { bottom, callback }) => {
+                    Some(frame @ Frame::Callback { bottom, callback }) => {
                         fuel.consume(Self::FUEL_PER_CALLBACK);
                         match callback.call(
                             ctx,
@@ -334,7 +343,10 @@ impl<'gc> Executor<'gc> {
                             }
                             Err(err) => {
                                 top_state.stack.truncate(bottom);
-                                top_state.frames.push(Frame::Error(err))
+                                top_state.frames.push(Frame::Error(
+                                    err,
+                                    top_state.backtrace(&ctx, Some(&frame)),
+                                ))
                             }
                         }
                     }
@@ -430,7 +442,17 @@ impl<'gc> Executor<'gc> {
                             }
                             Err(error) => {
                                 top_state.stack.truncate(bottom);
-                                top_state.frames.push(Frame::Error(error));
+                                top_state.frames.push(Frame::Error(
+                                    error,
+                                    top_state.backtrace(
+                                        &ctx,
+                                        Some(&Frame::Sequence {
+                                            bottom,
+                                            sequence,
+                                            pending_error: None,
+                                        }),
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -444,14 +466,17 @@ impl<'gc> Executor<'gc> {
                         };
                         match run_vm(ctx, lua_frame, Self::VM_GRANULARITY) {
                             Err(err) => {
-                                top_state.frames.push(Frame::Error(err.into()));
+                                top_state.frames.push(Frame::Error(
+                                    err.into(),
+                                    top_state.backtrace(&ctx, None),
+                                ));
                             }
                             Ok(instructions_run) => {
                                 fuel.consume(instructions_run.try_into().unwrap());
                             }
                         }
                     }
-                    Some(Frame::Error(err)) => {
+                    Some(Frame::Error(err, callstack)) => {
                         match top_state
                             .frames
                             .pop()
@@ -460,7 +485,7 @@ impl<'gc> Executor<'gc> {
                             Frame::Lua { bottom, .. } => {
                                 top_state.close_upvalues(&ctx, bottom);
                                 top_state.stack.truncate(bottom);
-                                top_state.frames.push(Frame::Error(err));
+                                top_state.frames.push(Frame::Error(err, callstack));
                             }
                             Frame::Sequence {
                                 bottom,
@@ -471,7 +496,7 @@ impl<'gc> Executor<'gc> {
                                 top_state.frames.push(Frame::Sequence {
                                     bottom,
                                     sequence,
-                                    pending_error: Some(err),
+                                    pending_error: Some(err), // TODO: don't discard callstack
                                 });
                             }
                             frame => panic!("tried to wind through improper frame {frame:?}"),

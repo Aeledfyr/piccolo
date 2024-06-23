@@ -311,6 +311,10 @@ pub trait Sequence<'gc>: Collect {
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         Err(error)
     }
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 /// A `Box` containing a value that implements [`Sequence`].
@@ -362,5 +366,9 @@ impl<'gc> BoxSequence<'gc> {
         stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         self.0.as_mut().error(ctx, exec, error, stack)
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.0.as_ref().name()
     }
 }
