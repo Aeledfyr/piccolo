@@ -111,10 +111,12 @@ pub fn load_string<'gc>(ctx: Context<'gc>) {
         }),
     );
 
-    if matches!(std::env::var("STACK").as_deref(), Ok("1" | "true")) {
-        load_pattern::<pattern::StackBackend>(ctx, string)
-    } else {
-        load_pattern::<pattern::SeqBackend>(ctx, string)
+    let mode = std::env::var("PAT_BACKEND");
+    let mode = mode.as_deref().unwrap_or("async");
+    match mode {
+        "stack" => load_pattern::<pattern::StackBackend>(ctx, string),
+        "seq" => load_pattern::<pattern::SeqBackend>(ctx, string),
+        "async" | _ => load_pattern_async(ctx, string),
     }
 
     ctx.set_global("string", string);
@@ -146,6 +148,16 @@ pub fn load_pattern<'gc, F: pattern::FindBackend>(ctx: Context<'gc>, string: Tab
     );
 
     string.set_field(ctx, "gsub", pattern::lua::lua_gsub_impl::<F>(ctx));
+}
+
+pub fn load_pattern_async<'gc>(ctx: Context<'gc>, string: Table<'gc>) {
+    string.set_field(ctx, "find", pattern::lua::lua_find_async(ctx));
+
+    string.set_field(ctx, "match", pattern::lua::lua_match_async(ctx));
+
+    string.set_field(ctx, "gmatch", pattern::lua::lua_gmatch_async(ctx));
+
+    string.set_field(ctx, "gsub", pattern::lua::lua_gsub_impl_async(ctx));
 }
 
 /// Convert a lua 1-indexed slice offset, which may be relative to the
