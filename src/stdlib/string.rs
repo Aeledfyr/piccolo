@@ -20,7 +20,7 @@ pub fn load_string<'gc>(ctx: Context<'gc>) {
         Callback::from_fn(&ctx, |ctx, _, mut stack| {
             let (string, i, j) = stack.consume::<(String, Option<i64>, Option<i64>)>(ctx)?;
             let i = i.unwrap_or(1);
-            let substr = sub(string.as_bytes(), i, j.or(Some(i)))?;
+            let substr = sub(string.as_bytes(), i, j.or(Some(i)));
             stack.extend(substr.iter().map(|b| Value::Integer(i64::from(*b))));
             Ok(CallbackReturn::Return)
         }),
@@ -46,7 +46,7 @@ pub fn load_string<'gc>(ctx: Context<'gc>) {
         "sub",
         Callback::from_fn(&ctx, |ctx, _, mut stack| {
             let (string, i, j) = stack.consume::<(String, i64, Option<i64>)>(ctx)?;
-            let substr = ctx.intern(sub(string.as_bytes(), i, j)?);
+            let substr = ctx.intern(sub(string.as_bytes(), i, j));
             stack.replace(ctx, substr);
             Ok(CallbackReturn::Return)
         }),
@@ -97,30 +97,53 @@ pub fn load_string<'gc>(ctx: Context<'gc>) {
         }),
     );
 
+    string
+        .set(
+            ctx,
+            "rep",
+            Callback::from_fn(&ctx, |ctx, _, mut stack| {
+                // TODO: fuel usage
+                let (string, count) = stack.consume::<(String, i64)>(ctx)?;
+                let repeated = string.repeat(count as usize);
+                stack.replace(ctx, ctx.intern(&repeated));
+                Ok(CallbackReturn::Return)
+            }),
+        )
+        .unwrap();
+
     ctx.set_global("string", string);
 }
 
-fn sub(string: &[u8], i: i64, j: Option<i64>) -> Result<&[u8], std::num::TryFromIntError> {
-    let i = match i {
-        i if i > 0 => i.saturating_sub(1).try_into()?,
+/// Convert a lua 1-indexed slice offset, which may be relative to the
+/// string length, to a positive zero-indexed Rust index.  Note that the
+/// index is *not* bounded to `len` when it is positive.
+///
+/// This can only fail on 32 bit platforms, where i64 values may not fit
+/// into a usize.
+fn convert_index(i: i64, len: usize) -> Option<usize> {
+    let val = match i {
         0 => 0,
-        i => string.len().saturating_sub(i.unsigned_abs().try_into()?),
+        v @ 1.. => v - 1,
+        v @ ..=-1 => (len as i64 + v).max(0),
     };
-    let j = if let Some(j) = j {
-        if j >= 0 {
-            j.try_into()?
-        } else {
-            let j: usize = j.unsigned_abs().try_into()?;
-            string.len().saturating_sub(j.saturating_sub(1))
-        }
-    } else {
-        string.len()
-    }
-    .clamp(0, string.len());
+    usize::try_from(val).ok()
+}
 
-    Ok(if i >= j || i >= string.len() {
-        &[]
-    } else {
-        &string[i..j]
-    })
+fn convert_index_end(i: i64, len: usize) -> Option<usize> {
+    let val = match i {
+        v @ 0.. => v,
+        v @ ..=-1 => (len as i64 + v + 1).max(0),
+    };
+    usize::try_from(val).ok()
+}
+
+fn sub(string: &[u8], i: i64, j: Option<i64>) -> &[u8] {
+    let len = string.len();
+    let i = convert_index(i, len).unwrap_or(usize::MAX);
+    let j = convert_index_end(j.unwrap_or(len as i64), len)
+        .unwrap_or(usize::MAX)
+        .min(len);
+
+    let slice = if i > j { &[] } else { &string[i..j] };
+    slice
 }
