@@ -33,6 +33,7 @@ do
     assert(string.len(-2147483648) == 11)
 end
 
+print("sub tests")
 do
     assert(is_err(function() return string.sub(nil) end))
     assert(is_err(function() return string.sub(true, 1) end))
@@ -97,6 +98,7 @@ do
     assert(string.upper(3.14) == "3.14")
 end
 
+print("byte tests")
 do
     assert(is_err(function() return string.byte(nil) end))
     assert(is_err(function() return string.byte(true) end))
@@ -124,6 +126,8 @@ do
     assert(string.byte("abcd", 2, -5) == nil)
     assert(string.byte("abcd", 3, 1) == nil)
 end
+
+print("char tests 2")
 
 do
     assert(is_err(function() return string.char(nil) end))
