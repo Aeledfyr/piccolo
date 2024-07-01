@@ -11,8 +11,8 @@ use crate::fuel::count_fuel;
 use crate::meta_ops::{self, MetaResult};
 use crate::table::RawTable;
 use crate::{
-    async_sequence, BoxSequence, Callback, CallbackReturn, Context, Error, Execution, IntoValue,
-    MetaMethod, Sequence, SequencePoll, SequenceReturn, Stack, Table, Value,
+    async_sequence, BoxSequence, Callback, CallbackReturn, Closure, Context, Error, Execution,
+    IntoValue, MetaMethod, Sequence, SequencePoll, SequenceReturn, Stack, Table, Value,
 };
 
 pub fn load_table<'gc>(ctx: Context<'gc>) {
@@ -66,6 +66,10 @@ pub fn load_table<'gc>(ctx: Context<'gc>) {
     table.set_field(ctx, "remove", Callback::from_fn(&ctx, table_remove_impl));
 
     table.set_field(ctx, "insert", Callback::from_fn(&ctx, table_insert_impl));
+
+    let data = include_str!("table/sort.lua");
+    let sort = Closure::load(ctx, Some("table/sort.lua"), data.as_bytes()).unwrap();
+    table.set_field(ctx, "sort", sort);
 
     ctx.set_global("table", table);
 }
