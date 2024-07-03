@@ -773,54 +773,6 @@ pub fn concat<'gc>(
     Ok(ConcatMetaResult::Value(Value::String(ctx.intern(&bytes))))
 }
 
-fn concat_impl_tree<'gc>(
-    ctx: Context<'gc>,
-    _exec: Execution<'gc, '_>,
-    stack: Stack<'gc, '_>,
-) -> Result<CallbackReturn<'gc>, Error<'gc>> {
-    let args = stack.len();
-    let s = async_sequence(&ctx, |_, builder| {
-        builder.build(|mut seq| async move {
-            let mut remaining = args;
-            while remaining > 1 {
-                for i in 0..remaining / 2 {
-                    let (call, bottom) = seq.try_enter(|ctx, locals, _, mut stack| {
-                        let bottom = stack.len();
-                        Ok(match concat_single(ctx, stack[i * 2], stack[i * 2 + 1])? {
-                            MetaResult::Value(v) => {
-                                stack.push_back(v);
-                                (None, bottom)
-                            }
-                            MetaResult::Call(MetaCall { function, args }) => {
-                                stack.extend(args);
-                                (Some(locals.stash(&ctx, function)), bottom)
-                            }
-                        })
-                    })?;
-                    if let Some(func) = call {
-                        seq.call(&func, bottom).await?;
-                    }
-                    seq.enter(|_, _, _, mut stack| {
-                        stack[i] = stack.get(bottom);
-                        stack.resize(bottom);
-                    });
-                }
-                if remaining % 2 == 1 {
-                    seq.enter(|_, _, _, mut stack| {
-                        stack[remaining / 2] = stack[remaining - 1];
-                    });
-                }
-                remaining = (remaining + 1) / 2;
-            }
-            seq.enter(|_, _, _, mut stack| {
-                stack.resize(1);
-            });
-            Ok(SequenceReturn::Return)
-        })
-    });
-    Ok(CallbackReturn::Sequence(s))
-}
-
 fn concat_impl<'gc>(
     ctx: Context<'gc>,
     _exec: Execution<'gc, '_>,
