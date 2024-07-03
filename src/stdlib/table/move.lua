@@ -49,13 +49,13 @@ if end_idx < src_base then
     return dst
 end
 
-if not (src_base > 0 or end_idx < math.maxinteger + src_base) then
-    error("too many elements to move")
+if src_base <= 0 and end_idx >= math.maxinteger + src_base then
+    error("too many elements to move") -- n would overflow
 end
 
 local n = end_idx - src_base + 1   -- number of elements to move
 
-if not (dst_base <= math.maxinteger - n + 1) then
+if dst_base > math.maxinteger - n + 1 then
     error("destination wrap around")
 end
 
