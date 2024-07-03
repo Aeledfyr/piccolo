@@ -32,8 +32,8 @@ do
 end
 
 do
-    assert(not pcall(function() table.concat({ true }) end))
-    assert(not pcall(function() table.concat({ {} }) end))
+    assert(not pcall(function() table.concat({ "a", true }) end))
+    assert(not pcall(function() table.concat({ "b", {} }) end))
 
     local t = setmetatable({ "a" }, { __len = function() return 2 end })
     assert(not pcall(function() table.concat(t) end))
