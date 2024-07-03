@@ -183,9 +183,41 @@ impl<D: DropGuard> FrozenScope<D> {
         drop(self.0);
         r
     }
+
+    /// Inside this call, all of the handles set with `FrozenScope::freeze` will be valid and can be
+    /// accessed with `Frozen::with` and `Frozen::with_mut`. The provided handles (and all clones of
+    /// them) are invalidated before this call to `FrozenScope::scope` returns.
+    ///
+    /// # Panics
+    /// Panics if any of the provided handles are already set inside another, outer
+    /// `FrozenScope::scope` call or if any handles were set with `FrozenScope::freeze` more than
+    /// once. The given handles must be used with only one `FrozenScope` at a time.
+    pub fn scope_returning<R>(mut self, cb: impl FnOnce() -> R) -> (R, D::Inner) {
+        // SAFETY: Safety depends on a few things...
+        //
+        // 1) We turn non-'static values into a 'static ones, outside code should never be able to
+        //    observe the held 'static value, because it lies about the true lifetime.
+        //
+        // 2) The only way to interact with the held 'static value is through `Frozen::[try_]with`
+        //    and `Frozen::[try_]with_mut`, both of which require a callback that works with the
+        //    frozen type for *any* lifetime. This interaction is safe because the callbacks must
+        //    work for any lifetime, so they must work with the lifetime we have erased.
+        //
+        // 3) The 'static `Frozen<F>` handles must have their values unset before the body of
+        //    this function ends because we only know they live for at least the body of this
+        //    function, and we use drop guards for this.
+        unsafe {
+            self.0.set();
+        }
+        let r = cb();
+        let inner = self.0.consume();
+        (r, inner)
+    }
 }
 
 pub trait DropGuard {
+    type Inner;
+
     // Sets the held `Frozen` handle to the held value.
     //
     // SAFETY:
@@ -196,16 +228,30 @@ pub trait DropGuard {
     //
     // Users of this trait *must* drop it before the lifetime of the held value ends.
     unsafe fn set(&mut self);
+
+    fn consume(self) -> Self::Inner;
 }
 
 impl DropGuard for () {
+    type Inner = ();
+
     unsafe fn set(&mut self) {}
+
+    fn consume(self) -> Self::Inner {
+        ()
+    }
 }
 
 impl<A: DropGuard, B: DropGuard> DropGuard for (A, B) {
+    type Inner = (A::Inner, B::Inner);
+
     unsafe fn set(&mut self) {
         self.0.set();
         self.1.set();
+    }
+
+    fn consume(self) -> Self::Inner {
+        (self.0.consume(), self.1.consume())
     }
 }
 
@@ -232,15 +278,37 @@ impl<'h, 'f, F: for<'a> Freeze<'a>> Drop for FreezeGuard<'h, 'f, F> {
 }
 
 impl<'h, 'f, F: for<'a> Freeze<'a>> DropGuard for FreezeGuard<'h, 'f, F> {
+    type Inner = <F as Freeze<'f>>::Frozen;
     unsafe fn set(&mut self) {
         assert!(
             !self.handle.is_valid(),
             "handle already used in another `FrozenScope::scope` call"
         );
-        *self.handle.inner.borrow_mut() = Some(mem::transmute::<
-            <F as Freeze<'f>>::Frozen,
-            <F as Freeze<'static>>::Frozen,
-        >(self.value.take().unwrap()));
+        *std::cell::RefCell::borrow_mut(&self.handle.inner) =
+            Some(mem::transmute::<
+                <F as Freeze<'f>>::Frozen,
+                <F as Freeze<'static>>::Frozen,
+            >(self.value.take().unwrap()));
+    }
+
+    fn consume(self) -> <F as Freeze<'f>>::Frozen {
+        if let Ok(mut v) = self.handle.inner.try_borrow_mut() {
+            let val = v.take().unwrap();
+            let inner = unsafe {
+                mem::transmute::<<F as Freeze<'static>>::Frozen, <F as Freeze<'f>>::Frozen>(val)
+            };
+            std::mem::forget(self);
+            inner
+        } else {
+            // This should not be possible to trigger safely, because users cannot hold
+            // `Ref` or `RefMut` handles from the inner `RefCell` in the first place,
+            // and `Frozen` does not implement Send so we can't be in the body of
+            // `Frozen::with[_mut]` in another thread. However, if it somehow happens that
+            // we cannot drop the held value, this means that there is a live reference to
+            // it somewhere so we are forced to abort the process.
+            eprintln!("impossible! freeze lock held during drop guard, aborting!");
+            std::process::abort()
+        }
     }
 }
 
