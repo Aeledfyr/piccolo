@@ -552,7 +552,8 @@ impl<'gc> ThreadState<'gc> {
                 // TODO: don't discard typeinfo, add metadata to Error?
                 // TODO: this breaks compat with tests
                 if std::env::var("DEBUG").as_deref() == Ok("1") {
-                    let err = anyhow::anyhow!(stack.to_string()).context(format!("{:?}", err.into_static()));
+                    let err = anyhow::anyhow!(stack.to_string())
+                        .context(format!("{:?}", err.into_static()));
                     Err(err.into())
                 } else {
                     Err(err)
