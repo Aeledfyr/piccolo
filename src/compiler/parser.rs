@@ -315,18 +315,40 @@ pub enum RecordKey<S> {
     Indexed(Expression<S>),
 }
 
+pub struct DummyStr;
+impl AsRef<[u8]> for DummyStr {
+    fn as_ref(&self) -> &[u8] {
+        &[]
+    }
+}
+
+#[derive(Debug)]
+pub enum Expected {
+    Str(&'static str),
+    Token(Token<DummyStr>),
+}
+
+impl std::fmt::Display for Expected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Expected::Str(s) => write!(f, "{}", s),
+            Expected::Token(t) => write!(f, "{}", t.token_name()),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ParseErrorKind {
-    #[error("found {unexpected:?}, expected {expected:?}")]
+    #[error("expected {expected}, found {}", unexpected.token_name())]
     Unexpected {
-        unexpected: String,
-        expected: String,
+        unexpected: Token<DummyStr>,
+        expected: Expected,
     },
     #[error(
         "unexpected end of token stream{}",
         .expected.as_ref().map(|e| format!(", expected {e}")).unwrap_or_default()
     )]
-    EndOfStream { expected: Option<String> },
+    EndOfStream { expected: Option<Expected> },
     #[error("cannot assign to expression")]
     AssignToExpression,
     #[error("expression is not a statement")]
@@ -337,6 +359,30 @@ pub enum ParseErrorKind {
     LexError(#[from] LexError),
     #[error("invalid attribute {0:?}")]
     InvalidAttribute(String),
+}
+
+impl ParseErrorKind {
+    fn with_expected(self, expected: Expected) -> ParseErrorKind {
+        match self {
+            ParseErrorKind::Unexpected { unexpected, .. } => ParseErrorKind::Unexpected {
+                unexpected,
+                expected,
+            },
+            ParseErrorKind::EndOfStream { .. } => ParseErrorKind::EndOfStream {
+                expected: Some(expected),
+            },
+            _ => self,
+        }
+    }
+}
+
+impl ParseError {
+    fn with_expected(self, expected: Expected) -> ParseError {
+        Self {
+            kind: self.kind.with_expected(expected),
+            line_number: self.line_number,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -567,8 +613,8 @@ impl<S: StringInterner> Parser<'_, S> {
 
             token => Err(ParseError {
                 kind: ParseErrorKind::Unexpected {
-                    unexpected: format!("{:?}", token),
-                    expected: "'=' or 'in'".to_owned(),
+                    unexpected: token.map_string(|_| DummyStr),
+                    expected: Expected::Str("'=' or 'in'"),
                 },
                 line_number: next.line_number,
             }),
@@ -846,8 +892,8 @@ impl<S: StringInterner> Parser<'_, S> {
             Token::Name(n) => Ok(PrimaryExpression::Name(n)),
             token => Err(ParseError {
                 kind: ParseErrorKind::Unexpected {
-                    unexpected: format!("{:?}", token),
-                    expected: "grouped expression or name".to_owned(),
+                    unexpected: token.map_string(|_| DummyStr),
+                    expected: Expected::Str("expression"),
                 },
                 line_number: next.line_number,
             }),
@@ -859,7 +905,11 @@ impl<S: StringInterner> Parser<'_, S> {
         match &next.inner {
             Token::Dot => {
                 self.take_next()?;
-                Ok(FieldSuffix::Named(self.expect_name()?.inner))
+                Ok(FieldSuffix::Named(
+                    self.expect_name()
+                        .map_err(|e| e.with_expected(Expected::Str("field name")))?
+                        .inner,
+                ))
             }
             Token::LeftBracket => {
                 self.take_next()?;
@@ -869,8 +919,8 @@ impl<S: StringInterner> Parser<'_, S> {
             }
             token => Err(ParseError {
                 kind: ParseErrorKind::Unexpected {
-                    unexpected: format!("{:?}", token),
-                    expected: "field or suffix".to_owned(),
+                    unexpected: token.map_string(|_| DummyStr),
+                    expected: Expected::Str("field or suffix"),
                 },
                 line_number: next.line_number,
             }),
@@ -881,7 +931,11 @@ impl<S: StringInterner> Parser<'_, S> {
         let method_name = match **self.get_next()? {
             Token::Colon => {
                 self.take_next()?;
-                Some(self.expect_name()?.inner)
+                Some(
+                    self.expect_name()
+                        .map_err(|e| e.with_expected(Expected::Str("method name")))?
+                        .inner,
+                )
             }
             _ => None,
         };
@@ -895,7 +949,8 @@ impl<S: StringInterner> Parser<'_, S> {
                 } else {
                     Vec::new()
                 };
-                self.expect_next(Token::RightParen)?;
+                self.expect_next(Token::RightParen)
+                    .map_err(|e| e.with_expected(Expected::Str("',' or ')'")))?;
                 args
             }
             Token::LeftBrace => vec![Expression {
@@ -913,8 +968,8 @@ impl<S: StringInterner> Parser<'_, S> {
             token => {
                 return Err(ParseError {
                     kind: ParseErrorKind::Unexpected {
-                        unexpected: format!("{:?}", token),
-                        expected: "function arguments".to_owned(),
+                        unexpected: token.map_string(|_| DummyStr),
+                        expected: Expected::Str("function arguments"),
                     },
                     line_number: next.line_number,
                 });
@@ -937,8 +992,8 @@ impl<S: StringInterner> Parser<'_, S> {
             }
             token => Err(ParseError {
                 kind: ParseErrorKind::Unexpected {
-                    unexpected: format!("{:?}", token),
-                    expected: "expression suffix".to_owned(),
+                    unexpected: token.map_string(|_| DummyStr),
+                    expected: Expected::Str("expression suffix"), // note: should be unreachable
                 },
                 line_number: next.line_number,
             }),
@@ -982,8 +1037,8 @@ impl<S: StringInterner> Parser<'_, S> {
                     token => {
                         return Err(ParseError {
                             kind: ParseErrorKind::Unexpected {
-                                unexpected: format!("{:?}", token),
-                                expected: "parameter name or '...'".to_owned(),
+                                unexpected: token.map_string(|_| DummyStr),
+                                expected: Expected::Str("parameter name or '...'"),
                             },
                             line_number: next.line_number,
                         });
@@ -1016,14 +1071,16 @@ impl<S: StringInterner> Parser<'_, S> {
                 break;
             }
             fields.push(self.parse_constructor_field()?);
-            match **self.get_next()? {
+            let token = self.get_next()?;
+            match **token {
                 Token::Comma | Token::SemiColon => {
                     self.take_next()?;
                 }
                 _ => break,
             }
         }
-        self.expect_next(Token::RightBrace)?;
+        self.expect_next(Token::RightBrace)
+            .map_err(|e| e.with_expected(Expected::Str("',', ';' or '}'")))?;
         Ok(TableConstructor { fields })
     }
 
@@ -1083,7 +1140,7 @@ impl<S: StringInterner> Parser<'_, S> {
         if self.read_buffer.is_empty() {
             Err(ParseError {
                 kind: ParseErrorKind::EndOfStream {
-                    expected: Some(format!("{:?}", token)),
+                    expected: Some(Expected::Token(token.map_string(|_| DummyStr))),
                 },
                 line_number: self.lexer.line_number(),
             })
@@ -1094,8 +1151,8 @@ impl<S: StringInterner> Parser<'_, S> {
             } else {
                 Err(ParseError {
                     kind: ParseErrorKind::Unexpected {
-                        unexpected: format!("{:?}", next_token.inner),
-                        expected: format!("{:?}", token),
+                        unexpected: next_token.inner.map_string(|_| DummyStr),
+                        expected: Expected::Token(token.map_string(|_| DummyStr)),
                     },
                     line_number: next_token.line_number,
                 })
@@ -1109,7 +1166,7 @@ impl<S: StringInterner> Parser<'_, S> {
         if self.read_buffer.is_empty() {
             Err(ParseError {
                 kind: ParseErrorKind::EndOfStream {
-                    expected: Some("name".to_owned()),
+                    expected: Some(Expected::Str("name")),
                 },
                 line_number: self.lexer.line_number(),
             })
@@ -1118,8 +1175,8 @@ impl<S: StringInterner> Parser<'_, S> {
                 Token::Name(name) => Ok(name),
                 token => Err(ParseError {
                     kind: ParseErrorKind::Unexpected {
-                        unexpected: format!("{:?}", token),
-                        expected: "name".to_owned(),
+                        unexpected: token.map_string(|_| DummyStr),
+                        expected: Expected::Str("name"),
                     },
                     line_number: self.lexer.line_number(),
                 }),
@@ -1133,7 +1190,7 @@ impl<S: StringInterner> Parser<'_, S> {
         if self.read_buffer.is_empty() {
             Err(ParseError {
                 kind: ParseErrorKind::EndOfStream {
-                    expected: Some("string".to_owned()),
+                    expected: Some(Expected::Str("string")),
                 },
                 line_number: self.lexer.line_number(),
             })
@@ -1142,8 +1199,8 @@ impl<S: StringInterner> Parser<'_, S> {
                 Token::String(string) => Ok(string),
                 token => Err(ParseError {
                     kind: ParseErrorKind::Unexpected {
-                        unexpected: format!("{:?}", token),
-                        expected: "string".to_owned(),
+                        unexpected: token.map_string(|_| DummyStr),
+                        expected: Expected::Str("string"),
                     },
                     line_number: self.lexer.line_number(),
                 }),
