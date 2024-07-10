@@ -19,6 +19,8 @@ fn convert_index(i: i64, len: i64) -> Result<usize, TryFromIntError> {
     .try_into()
 }
 
+mod format;
+
 pub fn load_string<'gc>(ctx: Context<'gc>) {
     let string = Table::new(&ctx);
 
@@ -152,6 +154,17 @@ pub fn load_string<'gc>(ctx: Context<'gc>) {
                 let repeated = string.repeat(count as usize);
                 stack.replace(ctx, ctx.intern(&repeated));
                 Ok(CallbackReturn::Return)
+            }),
+        )
+        .unwrap();
+
+    string
+        .set(
+            ctx,
+            "format",
+            Callback::from_fn(&ctx, |ctx, _, stack| {
+                let seq = format::string_format(ctx, stack)?;
+                Ok(CallbackReturn::Sequence(crate::BoxSequence::new(&ctx, seq)))
             }),
         )
         .unwrap();
