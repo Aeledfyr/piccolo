@@ -49,6 +49,10 @@ impl<'gc, 'a> Stack<'gc, 'a> {
             .unwrap_or_default()
     }
 
+    pub fn get_mut(&mut self, i: usize) -> Option<&mut Value<'gc>> {
+        self.values.get_mut(self.bottom + i)
+    }
+
     pub fn push_back(&mut self, value: Value<'gc>) {
         self.values.push(value);
     }
@@ -68,6 +72,15 @@ impl<'gc, 'a> Stack<'gc, 'a> {
     pub fn pop_front(&mut self) -> Option<Value<'gc>> {
         if self.values.len() > self.bottom {
             Some(self.values.remove(self.bottom))
+        } else {
+            None
+        }
+    }
+
+    pub fn remove(&mut self, i: usize) -> Option<Value<'gc>> {
+        let index = self.bottom + i;
+        if index < self.values.len() {
+            Some(self.values.remove(index))
         } else {
             None
         }
