@@ -1,7 +1,10 @@
-use std::{mem, pin::Pin};
+use std::io::Write;
+use std::mem;
+use std::pin::Pin;
 
 use anyhow::Context as _;
 use gc_arena::Collect;
+use thiserror::Error;
 
 use crate::{
     async_callback::{AsyncSequence, Locals},
@@ -9,9 +12,9 @@ use crate::{
     fuel::count_fuel,
     meta_ops::{self, MetaResult},
     table::RawTable,
-    BoxSequence, Callback, CallbackReturn, Context, Error, Execution, IntoValue, MetaMethod,
-    Sequence, SequencePoll, SequenceReturn, Stack, StashedError, StashedFunction, StashedTable,
-    StashedValue, Table, Value,
+    BoxSequence, Callback, CallbackReturn, Closure, Context, Error, Execution, FromValue, Function,
+    IntoValue, MetaMethod, Sequence, SequencePoll, SequenceReturn, Stack, StashedError,
+    StashedFunction, StashedTable, StashedValue, Table, Value,
 };
 
 pub fn load_table<'gc>(ctx: Context<'gc>) {
@@ -31,40 +34,65 @@ pub fn load_table<'gc>(ctx: Context<'gc>) {
         }),
     );
 
+    let unpack: Function<'gc> = Callback::from_fn(&ctx, |ctx, _, mut stack| {
+        let (table, start_arg, end_arg): (Value<'gc>, Option<i64>, Option<i64>) =
+            stack.consume(ctx)?;
+
+        let start = start_arg.unwrap_or(1);
+        let seq = if let Some(end) = end_arg {
+            if start > end {
+                return Ok(CallbackReturn::Return);
+            }
+
+            let length = try_compute_length(start, end)
+                .ok_or_else(|| "Too many values to unpack".into_value(ctx))?;
+            Unpack::MainLoop {
+                start,
+                table,
+                length,
+                index: 0,
+                batch_end: 0,
+                callback_return: false,
+            }
+        } else {
+            Unpack::FindLength { start, table }
+        };
+
+        Ok(CallbackReturn::Sequence(BoxSequence::new(&ctx, seq)))
+    })
+    .into();
+
+    table.set_field(ctx, "unpack", unpack.clone());
+
     table.set_field(
         ctx,
-        "unpack",
-        Callback::from_fn(&ctx, |ctx, _, mut stack| {
-            let (table, start_arg, end_arg): (Value<'gc>, Option<i64>, Option<i64>) =
-                stack.consume(ctx)?;
-
-            let start = start_arg.unwrap_or(1);
-            let seq = if let Some(end) = end_arg {
-                if start > end {
-                    return Ok(CallbackReturn::Return);
-                }
-
-                let length = try_compute_length(start, end)
-                    .ok_or_else(|| "Too many values to unpack".into_value(ctx))?;
-                Unpack::MainLoop {
-                    start,
-                    table,
-                    length,
-                    index: 0,
-                    batch_end: 0,
-                    callback_return: false,
-                }
-            } else {
-                Unpack::FindLength { start, table }
+        "concat",
+        Callback::from_fn_with(&ctx, unpack, move |unpack, ctx, _exec, mut stack| {
+            let sep = match stack.remove(1) {
+                Some(v) => <Option<Value>>::from_value(ctx, v)?,
+                None => None,
             };
 
-            Ok(CallbackReturn::Sequence(BoxSequence::new(&ctx, seq)))
+            // Defer to table.unpack for indexing implementation.
+            Ok(CallbackReturn::Call {
+                function: *unpack,
+                then: Some(concat_impl(ctx, sep)),
+            })
         }),
     );
+    // table.set_field(ctx, "concat", Callback::from_fn(&ctx, concat_impl));
 
     table.set_field(ctx, "remove", Callback::from_fn(&ctx, table_remove_impl));
 
     table.set_field(ctx, "insert", Callback::from_fn(&ctx, table_insert_impl));
+
+    let data = include_str!("table/sort.lua");
+    let func = Closure::load(ctx, Some("table/sort.lua"), data.as_bytes()).unwrap();
+    table.set_field(ctx, "sort", func);
+
+    let data = include_str!("table/move.lua");
+    let func = Closure::load(ctx, Some("table/move.lua"), data.as_bytes()).unwrap();
+    table.set_field(ctx, "move", func);
 
     ctx.set_global("table", table);
 }
@@ -730,4 +758,131 @@ fn array_insert_shift<'gc>(
 
     let length = table.length() as usize;
     (inner(table, length, key, value), length)
+}
+
+#[derive(Debug, Copy, Clone, Error)]
+pub enum TableConcatError {
+    #[error("resulting string too long in table.concat")]
+    Overflow,
+}
+
+fn concat_impl<'gc>(ctx: Context<'gc>, sep: Option<Value<'gc>>) -> BoxSequence<'gc> {
+    async_sequence(&ctx, |locals, mut seq| {
+        let sep = sep.map(|s| locals.stash(&ctx, s));
+        async move {
+            let args = seq.try_enter(|ctx, locals, _, mut stack| {
+                let sep_str = match sep
+                    .as_ref()
+                    .map(|s| locals.fetch(s))
+                    .map(|s| s.into_string(ctx))
+                {
+                    Some(Some(s)) => Some(s),
+                    Some(None) => return Ok(stack.len()),
+                    None => None,
+                };
+
+                let mut len = 0;
+                // Since we have to make two passes, might as well estimate the length
+                for value in &stack[..] {
+                    match value {
+                        Value::Integer(i) => len += i.ilog10() as usize + i.is_negative() as usize,
+                        Value::Number(_n) => len += 10,
+                        Value::String(s) => len += s.as_bytes().len(),
+                        _ => return Ok(stack.len()),
+                    }
+                }
+
+                let sep_len = sep_str.map(|s| s.len() as usize).unwrap_or(0);
+                let total_len = stack
+                    .len()
+                    .saturating_sub(1)
+                    .checked_mul(sep_len)
+                    .ok_or(TableConcatError::Overflow)?
+                    .checked_add(len)
+                    .ok_or(TableConcatError::Overflow)?;
+
+                // Should this be allocated in-place in the GC heap?
+                let mut bytes = Vec::with_capacity(total_len);
+
+                let mut iter = stack.drain(..);
+                if let Some(val) = iter.next() {
+                    match val {
+                        Value::Integer(i) => write!(&mut bytes, "{}", i).unwrap(),
+                        Value::Number(n) => write!(&mut bytes, "{}", n).unwrap(),
+                        Value::String(s) => bytes.extend(s.as_bytes()),
+                        _ => unreachable!(),
+                    }
+
+                    let sep = sep_str.map(|s| s.as_bytes()).unwrap_or(&[]);
+                    while let Some(val) = iter.next() {
+                        bytes.extend(sep);
+                        match val {
+                            Value::Integer(i) => write!(&mut bytes, "{}", i).unwrap(),
+                            Value::Number(n) => write!(&mut bytes, "{}", n).unwrap(),
+                            Value::String(s) => bytes.extend(s.as_bytes()),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                drop(iter);
+
+                let val = ctx.intern(&bytes);
+                stack.replace(ctx, val);
+                Ok(1)
+            })?;
+
+            for i in (1..args).into_iter().rev() {
+                if let Some(sep) = &sep {
+                    let (call, bottom) = seq.try_enter(|ctx, locals, _, mut stack| {
+                        let bottom = i;
+                        let lhs = locals.fetch(sep);
+                        let r = match meta_ops::concat_single(ctx, lhs, stack[i])? {
+                            MetaResult::Value(v) => {
+                                stack.resize(bottom);
+                                stack.push_back(v);
+                                (None, bottom)
+                            }
+                            MetaResult::Call(meta_ops::MetaCall { function, args }) => {
+                                stack.resize(bottom);
+                                stack.extend(args);
+                                (Some(locals.stash(&ctx, function)), bottom)
+                            }
+                        };
+                        Ok(r)
+                    })?;
+                    if let Some(func) = call {
+                        seq.call(&func, bottom).await?;
+                    }
+                    seq.enter(|_, _, _, mut stack| {
+                        stack.resize(bottom + 1);
+                    });
+                }
+
+                let (call, bottom) = seq.try_enter(|ctx, locals, _, mut stack| {
+                    let bottom = i - 1;
+                    Ok(
+                        match meta_ops::concat_single(ctx, stack[i - 1], stack[i])? {
+                            MetaResult::Value(v) => {
+                                stack.resize(bottom);
+                                stack.push_back(v);
+                                (None, bottom)
+                            }
+                            MetaResult::Call(meta_ops::MetaCall { function, args }) => {
+                                stack.resize(bottom);
+                                stack.extend(args);
+                                (Some(locals.stash(&ctx, function)), bottom)
+                            }
+                        },
+                    )
+                })?;
+                if let Some(func) = call {
+                    seq.call(&func, bottom).await?;
+                }
+                seq.enter(|_, _, _, mut stack| {
+                    stack.resize(bottom + 1);
+                });
+            }
+            Ok(SequenceReturn::Return)
+        }
+    })
 }
