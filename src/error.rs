@@ -57,14 +57,14 @@ pub enum ExternLuaError {
     Number(f64),
     #[error("{0}")]
     String(StdString),
-    #[error("<table {0:p}>")]
-    Table(*const ()),
-    #[error("<function {0:p}>")]
-    Function(*const ()),
-    #[error("<thread {0:p}>")]
-    Thread(*const ()),
-    #[error("<userdata {0:p}>")]
-    UserData(*const ()),
+    #[error("<table {0:x}>")]
+    Table(usize),
+    #[error("<function {0:x}>")]
+    Function(usize),
+    #[error("<thread {0:x}>")]
+    Thread(usize),
+    #[error("<userdata {0:x}>")]
+    UserData(usize),
 }
 
 impl<'gc> From<LuaError<'gc>> for ExternLuaError {
@@ -75,15 +75,21 @@ impl<'gc> From<LuaError<'gc>> for ExternLuaError {
             Value::Integer(i) => ExternLuaError::Integer(i),
             Value::Number(n) => ExternLuaError::Number(n),
             Value::String(s) => ExternLuaError::String(s.display_lossy().to_string()),
-            Value::Table(t) => ExternLuaError::Table(Gc::as_ptr(t.into_inner()) as *const ()),
+            Value::Table(t) => {
+                ExternLuaError::Table(Gc::as_ptr(t.into_inner()) as *const () as usize)
+            }
             Value::Function(Function::Callback(c)) => {
-                ExternLuaError::Function(Gc::as_ptr(c.into_inner()) as *const ())
+                ExternLuaError::Function(Gc::as_ptr(c.into_inner()) as *const () as usize)
             }
             Value::Function(Function::Closure(c)) => {
-                ExternLuaError::Function(Gc::as_ptr(c.into_inner()) as *const ())
+                ExternLuaError::Function(Gc::as_ptr(c.into_inner()) as *const () as usize)
             }
-            Value::Thread(t) => ExternLuaError::Thread(Gc::as_ptr(t.into_inner()) as *const ()),
-            Value::UserData(u) => ExternLuaError::UserData(Gc::as_ptr(u.into_inner()) as *const ()),
+            Value::Thread(t) => {
+                ExternLuaError::Thread(Gc::as_ptr(t.into_inner()) as *const () as usize)
+            }
+            Value::UserData(u) => {
+                ExternLuaError::UserData(Gc::as_ptr(u.into_inner()) as *const () as usize)
+            }
         }
     }
 }
