@@ -589,7 +589,8 @@ impl<'gc> ThreadState<'gc> {
                 assert!(self.open_upvalues.is_empty());
                 // TODO: don't discard typeinfo, add metadata to Error?
                 // TODO: this breaks compat with tests
-                if std::env::var("DEBUG").as_deref() == Ok("1") {
+                //if std::env::var("DEBUG").as_deref() == Ok("1") {
+                if true {
                     let err = anyhow::anyhow!(stack.to_string()).context(format!("{:?}", err));
                     Err(err.into())
                 } else {
