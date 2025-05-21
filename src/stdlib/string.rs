@@ -1,5 +1,6 @@
 use crate::{Callback, CallbackReturn, Context, FromValue, String, Table, Value};
 
+mod format;
 mod pattern;
 
 pub fn load_string<'gc>(ctx: Context<'gc>) {
@@ -110,6 +111,17 @@ pub fn load_string<'gc>(ctx: Context<'gc>) {
             Ok(CallbackReturn::Return)
         }),
     );
+
+    string
+        .set(
+            ctx,
+            "format",
+            Callback::from_fn(&ctx, |ctx, _, stack| {
+                let seq = format::string_format(ctx, stack)?;
+                Ok(CallbackReturn::Sequence(crate::BoxSequence::new(&ctx, seq)))
+            }),
+        )
+        .unwrap();
 
     let mode = std::env::var("PAT_BACKEND");
     let mode = mode.as_deref().unwrap_or("async");
