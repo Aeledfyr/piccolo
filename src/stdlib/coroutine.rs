@@ -90,5 +90,25 @@ pub fn load_coroutine<'gc>(ctx: Context<'gc>) {
         }),
     );
 
+    coroutine.set_field(
+        ctx,
+        "wrap",
+        Callback::from_fn(&ctx, |ctx, _, mut stack| {
+            let thread = Thread::new(ctx);
+            thread
+                .start_suspended(&ctx, meta_ops::call(ctx, stack.get(0))?)
+                .unwrap();
+
+            let callback = Callback::from_fn_with(&ctx, thread, |thread, _, _, _stack| {
+                Ok(CallbackReturn::Resume {
+                    thread: *thread,
+                    then: None,
+                })
+            });
+            stack.replace(ctx, callback);
+            Ok(CallbackReturn::Return)
+        }),
+    );
+
     ctx.set_global("coroutine", coroutine);
 }
