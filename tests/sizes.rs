@@ -13,5 +13,10 @@ fn test_sizes() {
     assert_eq!(mem::size_of::<Callback>(), ptr_size);
     assert_eq!(mem::size_of::<Thread>(), ptr_size);
     assert_eq!(mem::size_of::<UserData>(), ptr_size);
-    assert!(mem::size_of::<Value>() <= ptr_size * 2);
+
+    if ptr_size < 8 {
+        assert!(mem::size_of::<Value>() <= size_of::<u64>() + ptr_size);
+    } else {
+        assert!(mem::size_of::<Value>() <= ptr_size * 2);
+    }
 }
