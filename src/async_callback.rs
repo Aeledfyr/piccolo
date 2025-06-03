@@ -368,41 +368,49 @@ where
             },
         );
 
-        match res {
-            Poll::Ready(res) => {
-                assert!(
-                    next_op.is_none(),
-                    "`AsyncSequence` async method not `await`ed"
-                );
-                match res {
-                    Ok(SequenceReturn::Return) => Ok(SequencePoll::Return),
-                    Ok(SequenceReturn::Call(function)) => {
-                        Ok(SequencePoll::TailCall(function.fetch(locals)))
+        fn handle_next<'gc>(
+            locals: DynamicRootSet<'gc>,
+            next_op: Option<SequenceOp<'gc>>,
+            res: Poll<Result<SequenceReturn, StashedError>>,
+        ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+            match res {
+                Poll::Ready(res) => {
+                    assert!(
+                        next_op.is_none(),
+                        "`AsyncSequence` async method not `await`ed"
+                    );
+                    match res {
+                        Ok(SequenceReturn::Return) => Ok(SequencePoll::Return),
+                        Ok(SequenceReturn::Call(function)) => {
+                            Ok(SequencePoll::TailCall(function.fetch(locals)))
+                        }
+                        Ok(SequenceReturn::Yield(to_thread)) => {
+                            Ok(SequencePoll::TailYield(to_thread.map(|t| t.fetch(locals))))
+                        }
+                        Ok(SequenceReturn::Resume(thread)) => {
+                            Ok(SequencePoll::TailResume(thread.fetch(locals)))
+                        }
+                        Err(err) => Err(err.fetch(locals)),
                     }
-                    Ok(SequenceReturn::Yield(to_thread)) => {
-                        Ok(SequencePoll::TailYield(to_thread.map(|t| t.fetch(locals))))
-                    }
-                    Ok(SequenceReturn::Resume(thread)) => {
-                        Ok(SequencePoll::TailResume(thread.fetch(locals)))
-                    }
-                    Err(err) => Err(err.fetch(locals)),
                 }
+                Poll::Pending => Ok(
+                    match next_op.expect("`await` of a future other than `AsyncSequence` methods") {
+                        SequenceOp::Pending => SequencePoll::Pending,
+                        SequenceOp::Call { function, bottom } => {
+                            SequencePoll::Call { function, bottom }
+                        }
+                        SequenceOp::Yield { to_thread, bottom } => {
+                            SequencePoll::Yield { to_thread, bottom }
+                        }
+                        SequenceOp::Resume { thread, bottom } => {
+                            SequencePoll::Resume { thread, bottom }
+                        }
+                    },
+                ),
             }
-            Poll::Pending => Ok(
-                match next_op.expect("`await` of a future other than `AsyncSequence` methods") {
-                    SequenceOp::Pending => SequencePoll::Pending,
-                    SequenceOp::Call { function, bottom } => {
-                        SequencePoll::Call { function, bottom }
-                    }
-                    SequenceOp::Yield { to_thread, bottom } => {
-                        SequencePoll::Yield { to_thread, bottom }
-                    }
-                    SequenceOp::Resume { thread, bottom } => {
-                        SequencePoll::Resume { thread, bottom }
-                    }
-                },
-            ),
         }
+
+        handle_next(locals, next_op, res)
     }
 }
 

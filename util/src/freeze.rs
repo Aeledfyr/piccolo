@@ -1,4 +1,5 @@
-use std::{cell::RefCell, marker::PhantomData, mem, rc::Rc};
+use std::cell::RefMut;
+use std::{cell::RefCell, marker::PhantomData, mem, ops::DerefMut, rc::Rc};
 
 use thiserror::Error;
 
@@ -105,16 +106,24 @@ impl<F: for<'a> Freeze<'a>> Frozen<F> {
         self.try_with(f).unwrap()
     }
 
+    fn borrow_inner_mut(
+        &self,
+    ) -> Result<impl DerefMut<Target = <F as Freeze<'static>>::Frozen> + '_, AccessError> {
+        let guard = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| AccessError::BadBorrow)?;
+        RefMut::filter_map(guard, |inner| inner.as_mut()).map_err(|_| AccessError::Expired)
+    }
+
     pub fn try_with_mut<R>(
         &self,
         f: impl for<'f> FnOnce(&mut <F as Freeze<'f>>::Frozen) -> R,
     ) -> Result<R, AccessError> {
-        Ok(f(self
-            .inner
-            .try_borrow_mut()
-            .map_err(|_| AccessError::BadBorrow)?
-            .as_mut()
-            .ok_or(AccessError::Expired)?))
+        match self.borrow_inner_mut() {
+            Ok(mut inner) => Ok(f(&mut *inner)),
+            Err(e) => Err(e),
+        }
     }
 
     /// # Panics
